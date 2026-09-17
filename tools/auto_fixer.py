@@ -46,6 +46,12 @@ _FAILED_LINE = re.compile(
     re.MULTILINE
 )
 
+# 匹配 pytest 输出中的 "ERROR tests/xxx.py::test_yyy - 说明"
+_ERROR_LINE = re.compile(
+    r"^ERROR\s+(.+?\.py)(?:::[^\s]+)?(?:\s+-\s+.*)?$",
+    re.MULTILINE
+)
+
 # 匹配 traceback 中的文件路径，例如: File "tests/test_xxx.py", line 10
 _TRACEBACK_FILE = re.compile(r'File "([^"\r\n]+\.py)", line \d+')
 
@@ -105,8 +111,10 @@ def _is_relative_to(path: Path, directory: Path) -> bool:
 
 # ========== 3. 从 pytest 输出中找出失败的测试文件 ==========
 
-def _failed_test_files(output: str, project_root: Path) -> list[Path]:
-    """从 pytest 输出中提取 tests/ 目录下存在的 .py 文件。
+def _test_files_from_matches(
+    matches: Sequence[str], project_root: Path
+) -> list[Path]:
+    """把 pytest 输出中匹配到的路径转换为安全的测试文件路径。
 
     安全机制:
         - 只返回 tests/ 目录下的文件
@@ -115,11 +123,9 @@ def _failed_test_files(output: str, project_root: Path) -> list[Path]:
     """
     tests_root = (project_root / "tests").resolve()
 
-    # 从两种模式中提取候选路径
-    candidates = _FAILED_LINE.findall(output) + _TRACEBACK_FILE.findall(output)
     found: list[Path] = []
 
-    for raw_path in candidates:
+    for raw_path in matches:
         raw_path = raw_path.strip()
         candidate = Path(raw_path)
 
@@ -138,6 +144,20 @@ def _failed_test_files(output: str, project_root: Path) -> list[Path]:
             found.append(candidate)
 
     return found
+
+
+def _error_test_files(output: str, project_root: Path) -> list[Path]:
+    """提取发生 ERROR 的测试文件；ERROR 始终优先修复。"""
+    return _test_files_from_matches(_ERROR_LINE.findall(output), project_root)
+
+
+def _failed_test_files(output: str, project_root: Path) -> list[Path]:
+    """提取发生 FAILED 的测试文件。"""
+    failed_matches = _FAILED_LINE.findall(output)
+    if not failed_matches:
+        # 某些 pytest 插件不输出标准 FAILED 摘要，此时才使用 traceback 兜底。
+        failed_matches = _TRACEBACK_FILE.findall(output)
+    return _test_files_from_matches(failed_matches, project_root)
 
 
 # ========== 4. 从 AI 返回中提取纯代码 ==========
@@ -178,6 +198,7 @@ def _ask_for_fix(
     test_file: Path,
     project_root: Path,
     failure_output: str,
+    issue_type: str,
 ) -> str:
     """调用 OpenAI，让它返回修复后的测试代码。
 
@@ -208,7 +229,7 @@ def _ask_for_fix(
     relative_name = test_file.relative_to(project_root).as_posix()
 
     # 构造提示词
-    prompt = f"""你是一名资深 Python/pytest 工程师。请修复下面这个失败的测试文件。
+    prompt = f"""你是一名资深 Python/pytest 工程师。请修复下面发生 {issue_type} 的测试文件。
 
 规则：
 1. 只返回修复后文件的完整 Python 源码，不要 Markdown 代码块，不要解释。
@@ -264,20 +285,28 @@ def run_auto_fixer(
 
     # 最多重试 max_attempts 轮
     for attempt in range(1, max_attempts + 1):
-        # 找出失败的测试文件
-        failed_files = _failed_test_files(result.stdout, project_root)
-        if not failed_files:
+        # ERROR 优先：只要存在 ERROR，本轮就不处理 FAILED。
+        target_files = _error_test_files(result.stdout, project_root)
+        issue_type = "ERROR"
+        if not target_files:
+            target_files = _failed_test_files(result.stdout, project_root)
+            issue_type = "FAILED"
+
+        if not target_files:
             print(
-                "无法从 pytest 输出中定位 tests/ 下的失败测试文件，停止自动修复。",
+                "无法从 pytest 输出中定位 tests/ 下的 ERROR 或 FAILED 文件，停止自动修复。",
                 file=sys.stderr,
             )
             return result.returncode or 1
 
-        print(f"\n开始第 {attempt}/{max_attempts} 轮修复：{len(failed_files)} 个测试文件")
+        print(
+            f"\n开始第 {attempt}/{max_attempts} 轮修复："
+            f"优先处理 {len(target_files)} 个 {issue_type} 测试文件"
+        )
         changed = False
 
         # 逐个修复
-        for test_file in failed_files:
+        for test_file in target_files:
             try:
                 old_source = test_file.read_text(encoding="utf-8")
                 new_source = _ask_for_fix(
@@ -285,6 +314,7 @@ def run_auto_fixer(
                     test_file=test_file,
                     project_root=project_root,
                     failure_output=result.stdout,
+                    issue_type=issue_type,
                 )
 
                 # AI 没改

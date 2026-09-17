@@ -51,10 +51,14 @@ def sample_user(user_service):
     return user_service.create_user("Alice", 25, "alice@example.com")
 
 
-@pytest.fixture(params=[("Alice", 25), ("Bob", 30), ("Charlie", 35)])
-def sample_user(request, user_service):
-    name, age = request.param
-    return user_service.create_user(name, age)
+@pytest.fixture
+def sample_users(user_service):
+    """多个示例用户"""
+    return [
+        user_service.create_user("Alice", 25),
+        user_service.create_user("Bob", 30),
+        user_service.create_user("Charlie", 35),
+    ]
 
 
 @pytest.fixture(autouse=True)
