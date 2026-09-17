@@ -25,7 +25,9 @@ class TestUserService:
     
     def test_get_user(self, user_service, sample_user):
         user = user_service.get_user(sample_user.id)
-        assert user.name == "Alice"
+        assert user.id == sample_user.id
+        assert user.name == sample_user.name
+        assert user.age == sample_user.age
     
     def test_get_user_not_found(self, user_service):
         with pytest.raises(UserNotFoundError, match="用户不存在"):
